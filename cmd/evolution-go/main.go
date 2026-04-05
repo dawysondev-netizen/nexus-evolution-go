@@ -9,8 +9,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -25,6 +25,7 @@ import (
 	call_service "github.com/EvolutionAPI/evolution-go/pkg/call/service"
 	chat_handler "github.com/EvolutionAPI/evolution-go/pkg/chat/handler"
 	chat_service "github.com/EvolutionAPI/evolution-go/pkg/chat/service"
+	chatwoot_pkg "github.com/EvolutionAPI/evolution-go/pkg/chatwoot"
 	community_handler "github.com/EvolutionAPI/evolution-go/pkg/community/handler"
 	community_service "github.com/EvolutionAPI/evolution-go/pkg/community/service"
 	config "github.com/EvolutionAPI/evolution-go/pkg/config"
@@ -71,8 +72,6 @@ var devMode = flag.Bool("dev", false, "Enable development mode")
 var version = "0.0.0"
 
 func init() {
-	// ldflags -X main.version= sets this at compile time.
-	// If not set (or still default), try reading from VERSION file.
 	if version == "0.0.0" {
 		if v, err := os.ReadFile("VERSION"); err == nil {
 			if trimmed := strings.TrimSpace(string(v)); trimmed != "" {
@@ -100,13 +99,12 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 			loggerWrapper,
 		)
 	} else {
-		// Even if initial connection failed, pass the URL so reconnection can work
 		rabbitmqProducer = rabbitmq_producer.NewRabbitMQProducer(
 			nil,
 			config.AmqpGlobalEnabled,
 			config.AmqpGlobalEvents,
 			config.AmqpSpecificEvents,
-			config.AmqpUrl, // Keep the URL for reconnection attempts
+			config.AmqpUrl,
 			loggerWrapper,
 		)
 	}
@@ -132,7 +130,6 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 	webhookProducer := webhook_producer.NewWebhookProducer(config.WebhookUrl, loggerWrapper)
 	websocketProducer := websocket_producer.NewWebsocketProducer(loggerWrapper)
 
-	// Cria filas globais se o RabbitMQ global estiver habilitado
 	if config.AmqpGlobalEnabled && conn != nil {
 		logger.LogInfo("Creating global RabbitMQ queues...")
 		if err := rabbitmqProducer.CreateGlobalQueues(); err != nil {
@@ -197,14 +194,12 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 	labelService := label_service.NewLabelService(clientPointer, whatsmeowService, labelRepository, loggerWrapper)
 	newsletterService := newsletter_service.NewNewsletterService(clientPointer, whatsmeowService, loggerWrapper)
 
-	// NOVO: PollHandler usando PollService já inicializado no whatsmeowService (evita dupla inicialização)
 	pollHandler := poll_handler.NewPollHandler(whatsmeowService.GetPollService(), loggerWrapper)
 
 	telemetry := telemetry.NewTelemetryService()
 
 	r := gin.Default()
 
-	// CORS middleware — must be before everything else
 	r.Use(func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
@@ -219,10 +214,7 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 	})
 
 	r.Use(telemetry.TelemetryMiddleware())
-
 	r.Use(core.GateMiddleware(runtimeCtx))
-
-	// License routes (always accessible, even without license)
 	core.LicenseRoutes(r, runtimeCtx)
 
 	routes.NewRouter(
@@ -240,6 +232,9 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 		pollHandler,
 		server_handler.NewServerHandler(),
 	).AssignRoutes(r)
+
+	// NOSSO MÓDULO DO CHATWOOT REGISTRADO UMA ÚNICA VEZ AQUI
+	chatwoot_pkg.RegisterRoutes(r, db)
 
 	if config.ConnectOnStartup {
 		go whatsmeowService.ConnectOnStartup(config.ClientName)
@@ -262,7 +257,12 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 }
 
 func migrate(db *gorm.DB) {
-	err := db.AutoMigrate(&instance_model.Instance{}, &message_model.Message{}, &label_model.Label{})
+	err := db.AutoMigrate(
+		&instance_model.Instance{},
+		&message_model.Message{},
+		&label_model.Label{},
+		&chatwoot_pkg.ChatwootConfig{}, // NOSSA TABELA AQUI!
+	)
 
 	if err != nil {
 		log.Fatal(err)
@@ -311,11 +311,10 @@ func initPostgresAuthDB(config *config.Config) (*sql.DB, error) {
 		return nil, fmt.Errorf("erro ao conectar ao banco AUTH PostgreSQL: %v", err)
 	}
 
-	// Configurar pool de conexões para evitar conexões ociosas não fechadas
-	db.SetMaxOpenConns(25)                 // Máximo de 25 conexões abertas simultaneamente
-	db.SetMaxIdleConns(5)                  // Máximo de 5 conexões ociosas no pool
-	db.SetConnMaxLifetime(5 * time.Minute) // Reconectar após 5 minutos para evitar timeouts
-	db.SetConnMaxIdleTime(1 * time.Minute) // Fechar conexões ociosas após 1 minuto
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetConnMaxIdleTime(1 * time.Minute)
 
 	err = db.Ping()
 	if err != nil {
@@ -349,7 +348,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Inicializar PostgreSQL AUTH
 	authDB, err := initPostgresAuthDB(cfg)
 	if err != nil {
 		log.Fatal(err)
@@ -358,7 +356,6 @@ func main() {
 		defer authDB.Close()
 	}
 
-	// Manter inicialização do SQLite
 	sqliteDB, exPath, err := initAuthDB(cfg)
 	if err != nil {
 		log.Fatal(err)
@@ -369,7 +366,6 @@ func main() {
 
 	migrate(db)
 
-	// Initialize core DB + license runtime
 	core.SetDB(db)
 	if err := core.MigrateDB(); err != nil {
 		log.Fatal("Failed to migrate runtime_configs: ", err)
@@ -382,9 +378,8 @@ func main() {
 	if cfg.AmqpUrl != "" {
 		logger.LogInfo("Attempting to connect to RabbitMQ...")
 
-		// Create connection with heartbeat to prevent timeouts
 		amqpConfig := amqp.Config{
-			Heartbeat: 30 * time.Second, // Send heartbeat every 30 seconds
+			Heartbeat: 30 * time.Second,
 			Locale:    "en_US",
 		}
 
@@ -407,7 +402,6 @@ func main() {
 
 	r := setupRouter(db, authDB, sqliteDB, cfg, conn, exPath, runtimeCtx)
 
-	// Graceful shutdown with heartbeat
 	heartbeatCtx, heartbeatCancel := context.WithCancel(context.Background())
 	defer heartbeatCancel()
 
@@ -431,7 +425,6 @@ func main() {
 	<-quit
 	logger.LogInfo("[SHUTDOWN] Signal received, shutting down...")
 
-	// Stop heartbeat loop
 	heartbeatCancel()
 
 	core.Shutdown(runtimeCtx)

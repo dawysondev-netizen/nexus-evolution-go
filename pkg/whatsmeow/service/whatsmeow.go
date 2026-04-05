@@ -33,11 +33,14 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
+	// ADICIONADO PARA O CHATWOOT
+	chatwoot_pkg "github.com/EvolutionAPI/evolution-go/pkg/chatwoot"
 	"github.com/EvolutionAPI/evolution-go/pkg/config"
 	producer_interfaces "github.com/EvolutionAPI/evolution-go/pkg/events/interfaces"
 	instance_model "github.com/EvolutionAPI/evolution-go/pkg/instance/model"
 	instance_repository "github.com/EvolutionAPI/evolution-go/pkg/instance/repository"
 	"github.com/EvolutionAPI/evolution-go/pkg/internal/event_types"
+
 	label_model "github.com/EvolutionAPI/evolution-go/pkg/label/model"
 	label_repository "github.com/EvolutionAPI/evolution-go/pkg/label/repository"
 	logger_wrapper "github.com/EvolutionAPI/evolution-go/pkg/logger"
@@ -1500,9 +1503,66 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		postMap["data"] = dataMap
 
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] ===== MESSAGE PROCESSING COMPLETED ===== ID: %s, From: %s, Type: %s, Webhook: %v", mycli.userID, evt.Info.ID, evt.Info.Chat.String(), evt.Info.Type, doWebhook)
+
+		// ========= INÍCIO DA INTERCEPTAÇÃO DO CHATWOOT =========
+		if !evt.Info.IsFromMe {
+			var messageText string
+
+			if evt.Message.GetConversation() != "" {
+				messageText = evt.Message.GetConversation()
+			} else if evt.Message.GetExtendedTextMessage() != nil {
+				messageText = evt.Message.GetExtendedTextMessage().GetText()
+			}
+
+			// LOG RASTREADOR AQUI
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[Chatwoot Hook] Mensagem capturada! Instância: '%s', Texto: '%s'", mycli.Instance.Name, messageText)
+
+			if messageText != "" {
+				senderName := evt.Info.PushName
+				if senderName == "" {
+					senderName = "Cliente"
+				}
+				senderPhone := evt.Info.Sender.User
+
+				// --- NOVO: TRATAMENTO PARA GRUPOS E NOME DO REMETENTE (COM EMOJIS) ---
+				if evt.Info.IsGroup {
+					groupJid := evt.Info.Chat.User
+					// Adiciona o emoji de megafone como prefixo padrão
+					groupName := "📢 - Grupo " + groupJid
+
+					// Puxa o nome oficial do Grupo e adiciona o emoji
+					groupInfo, err := mycli.WAClient.GetGroupInfo(context.Background(), evt.Info.Chat)
+					if err == nil && groupInfo.Name != "" {
+						groupName = "📢 - " + groupInfo.Name
+					}
+
+					// Pega o número e o nome de quem enviou de verdade
+					actualSenderPhone := evt.Info.Sender.User
+					actualSenderName := evt.Info.PushName
+
+					// Monta a string visual do remetente (Ex: ✋ *5581984492026 / Rafael*)
+					var senderDisplay string
+					if actualSenderName != "" {
+						senderDisplay = fmt.Sprintf("✋ *%s / %s*", actualSenderPhone, actualSenderName)
+					} else {
+						senderDisplay = fmt.Sprintf("✋ *%s*", actualSenderPhone) // Se não tiver nome, vai só o número
+					}
+
+					// Injeta o nome do remetente na primeira linha da mensagem
+					messageText = senderDisplay + "\n" + messageText
+
+					// O contato principal da aba no Chatwoot será o Grupo
+					senderPhone = groupJid
+					senderName = groupName
+				}
+				// ----------------------------------------------------------------------
+
+				go chatwoot_pkg.ProcessIncomingMessage(mycli.Instance.Name, senderName, senderPhone, messageText)
+			}
+		}
+	// ========= FIM DA INTERCEPTAÇÃO DO CHATWOOT =========
+
 	case *events.Receipt:
-		doWebhook = true
-		postMap["event"] = "Receipt"
 
 		// se ignoreGroup for true e o chat for grupo retorna
 		if mycli.Instance.IgnoreGroups && strings.Contains(evt.Chat.String(), "@g.us") {
