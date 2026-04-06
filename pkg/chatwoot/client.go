@@ -6,14 +6,17 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
+	"net/textproto" // Essencial para ativar a pré-visualização de mídias
 	"net/url"
 	"strings"
 	"time"
 )
 
+// Otimizado para 30s para suportar o upload de documentos, áudios e vídeos mais pesados
 var httpClient = &http.Client{
-	Timeout: 10 * time.Second,
+	Timeout: 30 * time.Second,
 }
 
 func CreateInbox(config *ChatwootConfig) error {
@@ -63,16 +66,12 @@ func CreateInbox(config *ChatwootConfig) error {
 	return nil
 }
 
-func ProcessIncomingMessage(instanceName string, contactName string, contactNumber string, messageText string) {
-	log.Printf("[Chatwoot DEBUG] 1. Iniciando processamento... Instância: '%s', Contato: '%s', Número: '%s'", instanceName, contactName, contactNumber)
-
-	if messageText == "" {
-		log.Println("[Chatwoot DEBUG] 2. PARADA: O texto da mensagem está vazio!")
-		return
-	}
+// ATUALIZADO: Inclui o parâmetro mimeType para renderizar o arquivo corretamente
+func ProcessIncomingMessage(instanceName string, contactName string, contactNumber string, messageText string, fileData []byte, fileName string, mimeType string) {
+	log.Printf("[Chatwoot DEBUG] 1. Processando... Instância: '%s', Contato: '%s', Número: '%s'", instanceName, contactName, contactNumber)
 
 	if GlobalDB == nil {
-		log.Println("[Chatwoot ERRO] 3. PARADA: GlobalDB está nulo!")
+		log.Println("[Chatwoot ERRO] PARADA: GlobalDB está nulo!")
 		return
 	}
 
@@ -87,18 +86,22 @@ func ProcessIncomingMessage(instanceName string, contactName string, contactNumb
 
 	contactID, err := createOrGetContact(&config, contactName, contactNumber)
 	if err != nil {
-		log.Printf("[Chatwoot ERRO] 5. Erro ao criar contato: %v\n", err)
+		log.Printf("[Chatwoot ERRO] Erro ao criar contato: %v\n", err)
 		return
 	}
 
-	// NÃO PRECISAMOS MAIS DO sourceID AQUI
 	conversationID, err := createOrGetConversation(&config, contactID)
 	if err != nil {
-		log.Printf("[Chatwoot ERRO] 6. Erro ao criar/buscar conversa: %v\n", err)
+		log.Printf("[Chatwoot ERRO] Erro ao criar/buscar conversa: %v\n", err)
 		return
 	}
 
-	sendMessageToChatwoot(&config, conversationID, messageText)
+	// ROTEAMENTO: Se tiver arquivo (len > 0), dispara a função de mídia. Senão, dispara texto.
+	if len(fileData) > 0 {
+		sendMediaToChatwoot(&config, conversationID, messageText, fileData, fileName, mimeType)
+	} else {
+		sendTextToChatwoot(&config, conversationID, messageText)
+	}
 }
 
 func createOrGetContact(config *ChatwootConfig, name string, phone string) (int, error) {
@@ -131,8 +134,6 @@ func createOrGetContact(config *ChatwootConfig, name string, phone string) (int,
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 422 {
-		log.Printf("[Chatwoot DEBUG] Contato já existe. Buscando ID via Search...")
-
 		searchQuery := cleanPhone
 		if len(cleanPhone) <= 15 {
 			searchQuery = "+" + cleanPhone
@@ -146,7 +147,7 @@ func createOrGetContact(config *ChatwootConfig, name string, phone string) (int,
 
 		respSearch, errSearch := httpClient.Do(reqSearch)
 		if errSearch == nil {
-			defer respSearch.Body.Close()
+			defer respSearch.Body.Close() // Otimização: Garante fechamento do body da busca
 			var searchResult struct {
 				Payload []struct {
 					ID int `json:"id"`
@@ -179,39 +180,34 @@ func createOrGetContact(config *ChatwootConfig, name string, phone string) (int,
 	return result.Payload.Contact.ID, nil
 }
 
-// LOGICA NOVA: Busca conversa antes de criar (Ignorando Resolvidas)
 func createOrGetConversation(config *ChatwootConfig, contactID int) (int, error) {
 	baseURL := strings.TrimRight(config.BaseURL, "/")
 
-	// 1. TENTA BUSCAR UMA CONVERSA EXISTENTE ATIVA NESTE INBOX
 	getURL := fmt.Sprintf("%s/api/v1/accounts/%s/contacts/%d/conversations", baseURL, config.AccountID, contactID)
 	reqGet, _ := http.NewRequest("GET", getURL, nil)
 	reqGet.Header.Set("api_access_token", config.Token)
 
 	respGet, errGet := httpClient.Do(reqGet)
-	if errGet == nil && respGet.StatusCode == 200 {
-		defer respGet.Body.Close()
-		var getResult struct {
-			Payload []struct {
-				ID      int    `json:"id"`
-				InboxID int    `json:"inbox_id"`
-				Status  string `json:"status"` // NOVO: Lemos o status da conversa!
-			} `json:"payload"`
-		}
-		if err := json.NewDecoder(respGet.Body).Decode(&getResult); err == nil {
-			for _, conv := range getResult.Payload {
-				// Se for desta Inbox e NÃO estiver Resolvida, reaproveitamos a aba!
-				if conv.InboxID == config.InboxID && conv.Status != "resolved" {
-					log.Printf("[Chatwoot DEBUG] Aproveitando conversa ativa (Status: %s): ID %d", conv.Status, conv.ID)
-					return conv.ID, nil
+	if errGet == nil {
+		defer respGet.Body.Close() // Otimização: Prevenção de Memory Leak
+		if respGet.StatusCode == 200 {
+			var getResult struct {
+				Payload []struct {
+					ID      int    `json:"id"`
+					InboxID int    `json:"inbox_id"`
+					Status  string `json:"status"`
+				} `json:"payload"`
+			}
+			if err := json.NewDecoder(respGet.Body).Decode(&getResult); err == nil {
+				for _, conv := range getResult.Payload {
+					if conv.InboxID == config.InboxID && conv.Status != "resolved" {
+						return conv.ID, nil
+					}
 				}
 			}
 		}
-	} else if respGet != nil {
-		respGet.Body.Close()
 	}
 
-	// 2. SE NÃO ACHOU NENHUMA (OU TODAS ESTAVAM RESOLVIDAS), CRIA UMA NOVA!
 	url := fmt.Sprintf("%s/api/v1/accounts/%s/conversations", baseURL, config.AccountID)
 	payload := map[string]interface{}{
 		"inbox_id":   config.InboxID,
@@ -241,11 +237,10 @@ func createOrGetConversation(config *ChatwootConfig, contactID int) (int, error)
 		return 0, err
 	}
 
-	log.Printf("[Chatwoot DEBUG] Nova conversa criada: ID %d", result.ID)
 	return result.ID, nil
 }
 
-func sendMessageToChatwoot(config *ChatwootConfig, conversationID int, text string) {
+func sendTextToChatwoot(config *ChatwootConfig, conversationID int, text string) {
 	baseURL := strings.TrimRight(config.BaseURL, "/")
 	url := fmt.Sprintf("%s/api/v1/accounts/%s/conversations/%d/messages", baseURL, config.AccountID, conversationID)
 
@@ -268,8 +263,53 @@ func sendMessageToChatwoot(config *ChatwootConfig, conversationID int, text stri
 
 	if resp.StatusCode >= 400 {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		log.Printf("[Chatwoot] Erro %d na API ao enviar mensagem: %s", resp.StatusCode, string(bodyBytes))
+		log.Printf("[Chatwoot] Erro %d na API ao enviar texto: %s", resp.StatusCode, string(bodyBytes))
 	} else {
-		log.Println("[Chatwoot DEBUG] 7. SUCESSO ABSOLUTO! Mensagem injetada no Chatwoot!")
+		log.Println("[Chatwoot DEBUG] Mensagem de texto injetada no Chatwoot com sucesso!")
+	}
+}
+
+// NOVA FUNÇÃO: Upload nativo com Cabeçalho MIME para ativar Preview no Chatwoot
+func sendMediaToChatwoot(config *ChatwootConfig, conversationID int, caption string, fileData []byte, fileName string, mimeType string) {
+	baseURL := strings.TrimRight(config.BaseURL, "/")
+	apiUrl := fmt.Sprintf("%s/api/v1/accounts/%s/conversations/%d/messages", baseURL, config.AccountID, conversationID)
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	if caption == "" {
+		caption = " "
+	}
+
+	_ = writer.WriteField("content", caption)
+	_ = writer.WriteField("message_type", "incoming")
+
+	// Otimização: Forçando o Chatwoot a reconhecer o formato correto da mídia
+	h := make(textproto.MIMEHeader)
+	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="attachments[]"; filename="%s"`, fileName))
+	h.Set("Content-Type", mimeType)
+
+	part, err := writer.CreatePart(h)
+	if err == nil {
+		_, _ = io.Copy(part, bytes.NewReader(fileData))
+	}
+	_ = writer.Close()
+
+	req, _ := http.NewRequest("POST", apiUrl, body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("api_access_token", config.Token)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		log.Printf("[Chatwoot ERRO] Falha na rede ao enviar mídia: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		log.Printf("[Chatwoot ERRO] Erro %d da API ao enviar Mídia: %s", resp.StatusCode, string(bodyBytes))
+	} else {
+		log.Printf("[Chatwoot DEBUG] Mídia (%s | %s) enviada com sucesso para conversa %d!", fileName, mimeType, conversationID)
 	}
 }

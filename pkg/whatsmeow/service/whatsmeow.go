@@ -1504,9 +1504,12 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] ===== MESSAGE PROCESSING COMPLETED ===== ID: %s, From: %s, Type: %s, Webhook: %v", mycli.userID, evt.Info.ID, evt.Info.Chat.String(), evt.Info.Type, doWebhook)
 
-		// ========= INÍCIO DA INTERCEPTAÇÃO DO CHATWOOT =========
+		// ========= INÍCIO DA INTERCEPTAÇÃO DO CHATWOOT (MÍDIA UNIVERSAL COM PREVIEW) =========
 		if !evt.Info.IsFromMe {
 			var messageText string
+			var fileData []byte
+			var fileName string
+			var mimeType string // NOVO: Variável para guardar o tipo do arquivo
 
 			if evt.Message.GetConversation() != "" {
 				messageText = evt.Message.GetConversation()
@@ -1514,53 +1517,104 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				messageText = evt.Message.GetExtendedTextMessage().GetText()
 			}
 
-			// LOG RASTREADOR AQUI
-			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[Chatwoot Hook] Mensagem capturada! Instância: '%s', Texto: '%s'", mycli.Instance.Name, messageText)
+			// RADAR DE MÍDIAS (Agora extraindo o Mimetype)
+			if msg := evt.Message.GetImageMessage(); msg != nil {
+				fileData, _ = mycli.WAClient.Download(context.Background(), msg)
+				fileName = "imagem.jpeg"
+				mimeType = msg.GetMimetype()
+				if mimeType == "" {
+					mimeType = "image/jpeg"
+				}
+				if msg.GetCaption() != "" {
+					messageText = msg.GetCaption()
+				}
+			} else if msg := evt.Message.GetVideoMessage(); msg != nil {
+				fileData, _ = mycli.WAClient.Download(context.Background(), msg)
+				fileName = "video.mp4"
+				mimeType = msg.GetMimetype()
+				if mimeType == "" {
+					mimeType = "video/mp4"
+				}
+				if msg.GetCaption() != "" {
+					messageText = msg.GetCaption()
+				}
+			} else if msg := evt.Message.GetAudioMessage(); msg != nil {
+				fileData, _ = mycli.WAClient.Download(context.Background(), msg)
+				fileName = "audio.ogg"
+				mimeType = msg.GetMimetype()
+				if mimeType == "" {
+					mimeType = "audio/ogg"
+				}
+			} else if msg := evt.Message.GetDocumentMessage(); msg != nil {
+				fileData, _ = mycli.WAClient.Download(context.Background(), msg)
+				fileName = msg.GetFileName()
+				mimeType = msg.GetMimetype()
+				if fileName == "" {
+					fileName = "documento.pdf"
+				}
+				if mimeType == "" {
+					mimeType = "application/pdf"
+				}
+				if msg.GetCaption() != "" {
+					messageText = msg.GetCaption()
+				}
+			} else if msg := evt.Message.GetStickerMessage(); msg != nil {
+				fileData, _ = mycli.WAClient.Download(context.Background(), msg)
+				fileName = "figurinha.webp"
+				mimeType = msg.GetMimetype()
+				if mimeType == "" {
+					mimeType = "image/webp"
+				}
+			}
 
-			if messageText != "" {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[Chatwoot Hook] Mensagem capturada! Instância: '%s', Texto: '%s', Mídia: %v bytes", mycli.Instance.Name, messageText, len(fileData))
+
+			if messageText != "" || len(fileData) > 0 {
 				senderName := evt.Info.PushName
 				if senderName == "" {
 					senderName = "Cliente"
 				}
 				senderPhone := evt.Info.Sender.User
 
-				// --- NOVO: TRATAMENTO PARA GRUPOS E NOME DO REMETENTE (COM EMOJIS) ---
 				if evt.Info.IsGroup {
 					groupJid := evt.Info.Chat.User
-					// Adiciona o emoji de megafone como prefixo padrão
 					groupName := "📢 - Grupo " + groupJid
 
-					// Puxa o nome oficial do Grupo e adiciona o emoji
-					groupInfo, err := mycli.WAClient.GetGroupInfo(context.Background(), evt.Info.Chat)
+					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+					groupInfo, err := mycli.WAClient.GetGroupInfo(ctx, evt.Info.Chat)
+					cancel()
+
 					if err == nil && groupInfo.Name != "" {
 						groupName = "📢 - " + groupInfo.Name
 					}
 
-					// Pega o número e o nome de quem enviou de verdade
 					actualSenderPhone := evt.Info.Sender.User
 					actualSenderName := evt.Info.PushName
 
-					// Monta a string visual do remetente (Ex: ✋ *5581984492026 / Rafael*)
 					var senderDisplay string
 					if actualSenderName != "" {
 						senderDisplay = fmt.Sprintf("✋ *%s / %s*", actualSenderPhone, actualSenderName)
 					} else {
-						senderDisplay = fmt.Sprintf("✋ *%s*", actualSenderPhone) // Se não tiver nome, vai só o número
+						senderDisplay = fmt.Sprintf("✋ *%s*", actualSenderPhone)
 					}
 
-					// Injeta o nome do remetente na primeira linha da mensagem
-					messageText = senderDisplay + "\n" + messageText
+					var baseText string
+					if messageText == "" && len(fileData) > 0 {
+						baseText = "[Mídia Enviada]"
+					} else {
+						baseText = messageText
+					}
 
-					// O contato principal da aba no Chatwoot será o Grupo
+					messageText = senderDisplay + "\n" + baseText
 					senderPhone = groupJid
 					senderName = groupName
 				}
-				// ----------------------------------------------------------------------
 
-				go chatwoot_pkg.ProcessIncomingMessage(mycli.Instance.Name, senderName, senderPhone, messageText)
+				// Enviamos o mimeType também!
+				go chatwoot_pkg.ProcessIncomingMessage(mycli.Instance.Name, senderName, senderPhone, messageText, fileData, fileName, mimeType)
 			}
 		}
-	// ========= FIM DA INTERCEPTAÇÃO DO CHATWOOT =========
+		// ========= FIM DA INTERCEPTAÇÃO DO CHATWOOT =========
 
 	case *events.Receipt:
 

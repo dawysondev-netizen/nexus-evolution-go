@@ -33,3 +33,10 @@ Este documento registra as implementações da integração nativa e direta entr
 ---
 
 _Status Atual: Recepção de textos 100% funcional para DMs e Grupos._
+
+### 5. Motor Universal de Mídias (Inbound)
+
+- **Extrator Universal:** Identificação e download assíncrono de Imagens, Vídeos, Áudios (Mensagens de Voz), Documentos (PDF, DOCX, CSV, etc.) e Figurinhas (Stickers).
+- **Injeção de MIME Types (Previews):** Utilização do pacote `net/textproto` para montar cabeçalhos HTTP customizados, forçando o painel do Chatwoot a renderizar players nativos de áudio/vídeo e miniaturas de imagens, em vez de pacotes genéricos.
+- **Upload Multipart:** Conversão inteligente de binários em `multipart/form-data` para anexo nativo nas conversas.
+- **Prevenção de Gargalos:** Implementação de `context.Background()` nas rotinas de download e `Timeouts` de 30s no HTTP Client para suportar arquivos pesados sem travar o motor de eventos do WhatsApp.

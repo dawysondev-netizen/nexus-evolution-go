@@ -1,12 +1,23 @@
 package chatwoot
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
+
+// localClient otimiza as chamadas internas para a EvoGO reaproveitando conexões TCP
+var localClient = &http.Client{
+	Timeout: 10 * time.Second,
+}
 
 func SetChatwootConfig(c *gin.Context, db *gorm.DB) {
 	instanceName := c.Param("instance")
@@ -54,4 +65,99 @@ func SetChatwootConfig(c *gin.Context, db *gorm.DB) {
 		"message": "Instância conectada e Inbox gerada no Chatwoot",
 		"data":    config,
 	})
+}
+
+// ChatwootWebhook recebe as mensagens do painel do Chatwoot e envia pro WhatsApp
+func ChatwootWebhook(c *gin.Context, db *gorm.DB) {
+	var payload ChatwootWebhookPayload
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusOK, gin.H{"status": "ignored", "reason": "invalid_json"})
+		return
+	}
+
+	// Queremos apenas mensagens CRIADAS pelo ATENDENTE (outgoing) e que NÃO sejam notas privadas (private)
+	if payload.Event != "message_created" || payload.Private || payload.MessageType != "outgoing" {
+		c.JSON(http.StatusOK, gin.H{"status": "ignored", "reason": "not_outgoing_message"})
+		return
+	}
+
+	instanceName := payload.Inbox.Name
+	if instanceName == "" {
+		c.JSON(http.StatusOK, gin.H{"status": "ignored", "reason": "empty_inbox"})
+		return
+	}
+
+	// Prioriza o Identifier (Usado para Grupos), senão usa o PhoneNumber
+	number := payload.Conversation.Meta.Sender.Identifier
+	if number == "" {
+		number = payload.Conversation.Meta.Sender.PhoneNumber
+	}
+
+	// Limpa o número (Remove +, espaços, etc)
+	number = strings.ReplaceAll(number, "+", "")
+	number = strings.TrimSpace(number)
+
+	if number == "" || payload.Content == "" {
+		c.JSON(http.StatusOK, gin.H{"status": "ignored", "reason": "empty_number_or_content"})
+		return
+	}
+
+	log.Printf("[Chatwoot Webhook] Disparando mensagem para %s via Instância '%s'...", number, instanceName)
+
+	// Busca o token da instância no nosso banco de dados
+	var config ChatwootConfig
+	if err := db.Where("instance_name = ?", instanceName).First(&config).Error; err != nil {
+		log.Printf("[Chatwoot Webhook] Instância '%s' não configurada no banco.", instanceName)
+		c.JSON(http.StatusOK, gin.H{"status": "ignored", "reason": "instance_not_configured"})
+		return
+	}
+
+	// Dispara a mensagem usando a API local da Evolution
+	err := sendTextToEvolutionAPI(instanceName, config.Token, number, payload.Content)
+	if err != nil {
+		log.Printf("[Chatwoot Webhook] ERRO ao enviar para Evolution: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	log.Printf("[Chatwoot Webhook] SUCESSO! Mensagem enviada para %s", number)
+	c.JSON(http.StatusOK, gin.H{"status": "success"})
+}
+
+// sendTextToEvolutionAPI faz uma requisição HTTP interna (localhost) para a Evo GO disparar a mensagem
+func sendTextToEvolutionAPI(instanceName string, token string, number string, text string) error {
+	url := "http://localhost:8080/send/text"
+
+	payload := map[string]interface{}{
+		"number": number,
+		"text":   text,
+	}
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("erro no json marshal: %v", err)
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("erro na requisicao: %v", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("apikey", token)
+	req.Header.Set("instance", instanceName)
+
+	// Utiliza o cliente global otimizado em vez de criar um novo
+	resp, err := localClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("falha de conexao local: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("status HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	return nil
 }

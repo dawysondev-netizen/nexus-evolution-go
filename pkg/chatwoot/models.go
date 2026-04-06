@@ -26,3 +26,22 @@ type ContactCreatePayload struct {
 	Name        string `json:"name"`
 	PhoneNumber string `json:"phone_number"`
 }
+
+// ChatwootWebhookPayload representa o JSON que o Chatwoot nos envia
+type ChatwootWebhookPayload struct {
+	Event       string `json:"event"`
+	MessageType string `json:"message_type"`
+	Private     bool   `json:"private"`
+	Content     string `json:"content"`
+	Inbox       struct {
+		Name string `json:"name"`
+	} `json:"inbox"`
+	Conversation struct {
+		Meta struct {
+			Sender struct {
+				PhoneNumber string `json:"phone_number"`
+				Identifier  string `json:"identifier"`
+			} `json:"sender"`
+		} `json:"meta"`
+	} `json:"conversation"`
+}
